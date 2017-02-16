@@ -29,5 +29,6 @@ xcuserdata/
 node_modules
 *.log
 
-## Android iml
+## Android Studio
 *.iml
+.idea/

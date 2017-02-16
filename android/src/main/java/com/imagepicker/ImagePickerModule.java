@@ -14,6 +14,8 @@ import android.graphics.Matrix;
 import android.graphics.drawable.ColorDrawable;
 import android.media.ExifInterface;
 import android.net.Uri;
+import android.os.Build;
+import android.os.AsyncTask;
 import android.os.Environment;
 import android.provider.MediaStore;
 import android.support.v4.app.ActivityCompat;
@@ -64,6 +66,8 @@ public class ImagePickerModule extends ReactContextBaseJavaModule {
   static final int REQUEST_LAUNCH_VIDEO_LIBRARY = 13003;
   static final int REQUEST_LAUNCH_VIDEO_CAPTURE = 13004;
 
+  public static final String TAG = "rn-image-picker";
+
   private final ReactApplicationContext mReactContext;
   private ImagePickerActivityEventListener mActivityEventListener;
 
@@ -72,6 +76,8 @@ public class ImagePickerModule extends ReactContextBaseJavaModule {
   private Boolean noData = false;
   private Boolean tmpImage;
   private Boolean pickVideo = false;
+  private Boolean waitUntilSaved = false;
+  private int waitUntilSavedTimeout = 30;
   private int maxWidth = 0;
   private int maxHeight = 0;
   private int quality = 100;
@@ -319,28 +325,30 @@ public class ImagePickerModule extends ReactContextBaseJavaModule {
     switch (requestCode) {
       case REQUEST_LAUNCH_IMAGE_CAPTURE:
         uri = mCameraCaptureURI;
-        this.fileScan(uri.getPath());
-        break;
+        ImageScanCompletedListener imageScanCompletedListener = new ImageScanCompletedListener(uri, waitUntilSaved, waitUntilSavedTimeout);
+        MediaScannerConnection.scanFile(mReactContext, new String[] { uri.getPath() }, null, imageScanCompletedListener);
+        return;
       case REQUEST_LAUNCH_IMAGE_LIBRARY:
         uri = data.getData();
-        break;
+        handleImageSelected(uri);
+        return;
       case REQUEST_LAUNCH_VIDEO_LIBRARY:
-        response.putString("uri", data.getData().toString());
-        response.putString("path", getRealPathFromURI(data.getData()));
-        mCallback.invoke(response);
-        mCallback = null;
+        uri = data.getData();
+        handleVideoSelected(uri);
         return;
       case REQUEST_LAUNCH_VIDEO_CAPTURE:
-        response.putString("uri", data.getData().toString());
-        response.putString("path", getRealPathFromURI(data.getData()));
-        this.fileScan(response.getString("path"));
-        mCallback.invoke(response);
-        mCallback = null;
+        uri = data.getData();
+        String path = getRealPathFromURI(uri);
+        VideoScanCompletedListener videoScanCompletedListener = new VideoScanCompletedListener(uri, waitUntilSaved, waitUntilSavedTimeout);
+        MediaScannerConnection.scanFile(mReactContext, new String[] { path }, null, videoScanCompletedListener);
         return;
       default:
-        uri = null;
+        handleImageSelected(null);
+        return;
     }
+  }
 
+  public void handleImageSelected(Uri uri) {
     String realPath = getRealPathFromURI(uri);
     boolean isUrl = false;
 
@@ -450,7 +458,21 @@ public class ImagePickerModule extends ReactContextBaseJavaModule {
     }
 
     putExtraFileInfo(realPath, response);
+    mCallback.invoke(response);
+    mCallback = null;
+  }
 
+  public void handleVideoSelected(Uri uri) {
+    String path = getRealPathFromURI(uri);
+    response.putString("uri", uri.toString());
+    response.putString("path", path);
+    mCallback.invoke(response);
+    mCallback = null;
+  }
+
+  public void handleFailedToSaveError(Uri uri) {
+    response.putString("error", "Could not save image/video");
+    response.putString("uri", uri.toString());
     mCallback.invoke(response);
     mCallback = null;
   }
@@ -737,19 +759,91 @@ public class ImagePickerModule extends ReactContextBaseJavaModule {
     if (options.hasKey("durationLimit")) {
       videoDurationLimit = options.getInt("durationLimit");
     }
-  }
-
-  public void fileScan(String path){
-    MediaScannerConnection.scanFile(mReactContext,
-            new String[] { path }, null,
-            new MediaScannerConnection.OnScanCompletedListener() {
-
-              public void onScanCompleted(String path, Uri uri) {
-                Log.i("TAG", "Finished scanning " + path);
-              }
-            });
+    waitUntilSaved = false;
+    if (options.hasKey("storageOptions")) {
+      ReadableMap storageOptions = options.getMap("storageOptions");
+      if (storageOptions.hasKey("waitUntilSaved")) {
+        waitUntilSaved = storageOptions.getBoolean("waitUntilSaved");
+      }
+    }
+    waitUntilSavedTimeout = 30;
+    if (options.hasKey("storageOptions")) {
+      ReadableMap storageOptions = options.getMap("storageOptions");
+      if (storageOptions.hasKey("waitUntilSavedTimeout")) {
+        waitUntilSavedTimeout = storageOptions.getInt("waitUntilSavedTimeout");
+      }
+    }
   }
 
   // Required for RN 0.30+ modules than implement ActivityEventListener
   public void onNewIntent(Intent intent) { }
+
+  private class ImageScanCompletedListener implements MediaScannerConnection.OnScanCompletedListener {
+    private boolean waitUntilSaved;
+    private int waitUntilSavedTimeout;
+    private Uri imageUri;
+
+    public ImageScanCompletedListener(Uri uri, boolean waitUntilSaved, int waitUntilSavedTimeout) {
+      this.imageUri = uri;
+      this.waitUntilSaved = waitUntilSaved;
+      this.waitUntilSavedTimeout = waitUntilSavedTimeout;
+      // If we are not to wait until the image is saved, we proceed immediately.
+      if (!this.waitUntilSaved) {
+        handleImageSelected(this.imageUri);
+      }
+    }
+    @Override
+    public void onScanCompleted(String path, Uri uri) {
+      if (this.waitUntilSaved) {
+        final Uri fileUri = this.imageUri;
+        AsyncTask<Void, Void, Boolean> checkFileSizeAsyncTask = new CheckFileSizeAsyncTask(fileUri.getPath(), this.waitUntilSavedTimeout, new CheckFileSizeAsyncTask.FileSizeAsyncResponse() {
+          @Override
+          public void processFinish(Boolean result) {
+            if (result == true) {
+              handleImageSelected(fileUri);
+            } else {
+              handleFailedToSaveError(fileUri);
+            }
+          }
+        }).execute();
+      } else {
+        // we do nothing, as image handling has already been handled in the constructor
+      }
+    }
+  }
+
+  private class VideoScanCompletedListener implements MediaScannerConnection.OnScanCompletedListener {
+    private boolean waitUntilSaved;
+    private int waitUntilSavedTimeout;
+    private Uri videoUri;
+
+    public VideoScanCompletedListener(Uri uri, boolean waitUntilSaved, int waitUntilSavedTimeout) {
+      this.videoUri = uri;
+      this.waitUntilSaved = waitUntilSaved;
+      this.waitUntilSavedTimeout = waitUntilSavedTimeout;
+      // If we are not to wait until the video is saved, we proceed immediately.
+      if (!this.waitUntilSaved) {
+        handleVideoSelected(this.videoUri);
+      }
+    }
+    @Override
+    public void onScanCompleted(String path, Uri uri) {
+      if (this.waitUntilSaved) {
+        final Uri fileUri = this.videoUri;
+        AsyncTask<Void, Void, Boolean> checkFileSizeAsyncTask = new CheckFileSizeAsyncTask(fileUri.getPath(), waitUntilSavedTimeout, new CheckFileSizeAsyncTask.FileSizeAsyncResponse() {
+          @Override
+          public void processFinish(Boolean result) {
+            if (result == true) {
+              handleVideoSelected(fileUri);
+            } else {
+              handleFailedToSaveError(fileUri);
+            }
+          }
+        }).execute();
+      } else {
+        // we do nothing, as video handling has already been handled in the constructor
+      }
+    }
+  }
+
 }
